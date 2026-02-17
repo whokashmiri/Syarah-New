@@ -1,3 +1,4 @@
+# mongo.py
 from __future__ import annotations
 
 from pymongo import MongoClient, ASCENDING
@@ -11,7 +12,6 @@ def get_collection(mongo_url: str, db_name: str, col_name: str) -> Collection:
     db = client[db_name]
     col = db[col_name]
 
-    # Ensure unique index on 'id' (post id)
     try:
         col.create_index([("id", ASCENDING)], unique=True, name="uniq_id")
     except Exception as e:
@@ -20,75 +20,61 @@ def get_collection(mongo_url: str, db_name: str, col_name: str) -> Collection:
     return col
 
 
+def _is_good_status(x) -> bool:
+    try:
+        x = int(x)
+    except Exception:
+        return False
+    return x not in (0, 401) and 200 <= x < 500  # treat 2xx/3xx/4xx(≠401) as "real response"
+
+
 def _is_bad_doc(doc: dict | None) -> bool:
     """
-    A doc is 'bad' if we don't have a real API status/body yet.
-    We treat these as repairable and allow updates.
+    Since you no longer store `api`, we judge by the tiny status fields.
+    A doc is BAD if it doesn't have real status codes yet (or looks like unauthorized/empty).
     """
     if not doc:
         return True
 
-    # Most important signal: details status
-    details = (((doc.get("api") or {}).get("details") or {}).get("res") or {})
-    insp = (((doc.get("api") or {}).get("inspection") or {}).get("res") or {})
+    d_status = doc.get("details_status")
+    i_status = doc.get("inspection_status")
 
-    d_status = details.get("status")
-    i_status = insp.get("status")
+    # If either is a real status, consider it "good enough"
+    if _is_good_status(d_status) or _is_good_status(i_status):
+        return False
 
-    # status missing/null => bad
-    if d_status in (None, 0) and i_status in (None, 0):
-        return True
-
-    # if we have neither json nor text, it's bad
-    d_has_payload = bool(details.get("json") is not None or (details.get("text") or "").strip())
-    i_has_payload = bool(insp.get("json") is not None or (insp.get("text") or "").strip())
-
-    if not d_has_payload and not i_has_payload:
-        return True
-
-    return False
+    return True
 
 
 def already_have(col: Collection, post_id: int) -> bool:
     """
-    Return True only if we already have a 'good' doc.
-    If doc exists but is bad/incomplete, return False so we refetch + repair.
+    True only if we already have a "good" doc.
     """
-    doc = col.find_one({"id": int(post_id)}, {"_id": 1, "api": 1})
+    doc = col.find_one({"id": int(post_id)}, {"_id": 1, "details_status": 1, "inspection_status": 1})
     return (doc is not None) and (not _is_bad_doc(doc))
 
 
 def upsert_post(col: Collection, post: dict) -> str:
     """
     Insert or repair.
-    Returns one of: "inserted" | "updated" | "skipped"
+    Returns: "inserted" | "updated" | "skipped"
     """
     post_id = int(post.get("id"))
 
-    existing = col.find_one({"id": post_id}, {"_id": 1, "api": 1})
+    existing = col.find_one({"id": post_id}, {"_id": 1, "details_status": 1, "inspection_status": 1})
+
     if existing is None:
-        # Insert new
         try:
             col.insert_one(post)
             return "inserted"
         except Exception as e:
-            # In case of race condition, fall through to update logic
             log(f"[mongo] insert_one warning id={post_id}: {e}")
+            existing = col.find_one({"id": post_id}, {"_id": 1, "details_status": 1, "inspection_status": 1})
 
-    # If existing is good, skip to avoid rewriting
     if existing is not None and not _is_bad_doc(existing):
         return "skipped"
 
-    # Otherwise, repair/update the doc
-    # We replace key fields but keep Mongo _id.
-    # You can add "$set": post to fully replace, but safer to set known top-level fields.
-    res = col.update_one(
-        {"id": post_id},
-        {"$set": post},
-        upsert=True,
-    )
-
-    # If it upserted due to race: inserted, else updated
+    res = col.update_one({"id": post_id}, {"$set": post}, upsert=True)
     if res.upserted_id:
         return "inserted"
     return "updated"

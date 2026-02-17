@@ -1,3 +1,4 @@
+# main.py 
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,52 @@ from .syarah import (
     JS_SCROLL_STEP,
     build_api_session,
     fetch_post_payloads_requests,
+    try_click_load_more,
 )
+
+
+async def ensure_window_visible(page: Any) -> None:
+    """
+    Best-effort: try to make the browser window visible & maximized.
+    Some sites won't load more cards if the window is minimized/backgrounded.
+    """
+    # Bring page to front if supported
+    try:
+        if hasattr(page, "bring_to_front"):
+            await page.bring_to_front()
+        elif hasattr(page, "bringToFront"):
+            await page.bringToFront()
+    except Exception:
+        pass
+
+    # Maximize via JS (works sometimes, not always)
+    try:
+        await page.evaluate(
+            """
+            (() => {
+              try { window.focus(); } catch(e) {}
+              try { document.body && document.body.focus && document.body.focus(); } catch(e) {}
+              return true;
+            })()
+            """
+        )
+    except Exception:
+        pass
+
+    # Try to resize viewport (often helps lazy loading)
+    try:
+        if hasattr(page, "set_viewport"):
+            await page.set_viewport({"width": 1400, "height": 900})
+        elif hasattr(page, "setViewport"):
+            await page.setViewport({"width": 1400, "height": 900})
+    except Exception:
+        pass
+
+    # Small delay after focusing/resizing
+    try:
+        await page.sleep(0.3)
+    except Exception:
+        pass
 
 
 async def _get_current_url(page: Any, fallback: str = "") -> str:
@@ -98,6 +144,8 @@ def _details_status(payload: dict) -> Optional[int]:
 async def scrape_once(browser: Any, settings) -> None:
     log(f"[syarah] Opening: {settings.target_url}")
     page = await browser.get(settings.target_url)
+    await ensure_window_visible(page)
+
 
     await wait_for_listing_ready(page)
 
@@ -164,7 +212,9 @@ async def scrape_once(browser: Any, settings) -> None:
         # If scrolling stalls AND we're not done, refresh current URL.
         # -------------------------
         if not unprocessed:
+            await ensure_window_visible(page)
             info = _scroll_info(await page.evaluate(JS_SCROLL_STEP))
+
             after_y = info.get("afterY")
 
             log(f"[scroll] (no new) y:{info.get('beforeY')}->{after_y} h={info.get('h')}")
@@ -185,6 +235,13 @@ async def scrape_once(browser: Any, settings) -> None:
 
             last_scroll_after = after_y
             last_seen_unique = len(processed_ids)
+            # ✅ If we are stuck, try clicking "Load more cars"
+            if stuck_rounds >= 3:
+                await ensure_window_visible(page)
+                clicked = await try_click_load_more(page)
+                if clicked:
+                    stuck_rounds = 0
+                    continue
 
             # refresh threshold
             if total and len(processed_ids) < int(total) and stuck_rounds >= 8:
@@ -259,6 +316,7 @@ async def scrape_once(browser: Any, settings) -> None:
 
         # ✅ Scroll only after processing this chunk
         if len(chunk) >= 16 or (len(chunk) == len(unprocessed)):
+            await ensure_window_visible(page)
             info = _scroll_info(await page.evaluate(JS_SCROLL_STEP))
             log(
                 f"[scroll] (after processing {len(chunk)}) "
