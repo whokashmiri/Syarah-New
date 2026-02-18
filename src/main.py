@@ -24,12 +24,97 @@ from .syarah import (
 )
 
 
-async def ensure_window_visible(page: Any) -> None:
+
+import os
+from typing import Any, Optional
+
+
+def _get_browser_pid(browser: Any) -> Optional[int]:
     """
-    Best-effort: try to make the browser window visible & maximized.
-    Some sites won't load more cards if the window is minimized/backgrounded.
+    Try to extract Chrome PID from nodriver browser object.
     """
-    # Bring page to front if supported
+    for attr in ("pid", "_pid", "process_pid"):
+        v = getattr(browser, attr, None)
+        if isinstance(v, int) and v > 0:
+            return v
+
+    for attr in ("process", "_process", "proc", "_proc"):
+        p = getattr(browser, attr, None)
+        if p is None:
+            continue
+        v = getattr(p, "pid", None)
+        if isinstance(v, int) and v > 0:
+            return v
+
+    return None
+
+
+def _win_restore_maximize_by_pid(pid: int) -> bool:
+    """
+    Windows-only: Restore + Maximize a window by PID.
+    Works even if user minimized it manually.
+    """
+    try:
+        import win32gui
+        import win32con
+        import win32process
+
+        handles = []
+
+        def enum_callback(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+
+            _, win_pid = win32process.GetWindowThreadProcessId(hwnd)
+            if win_pid != pid:
+                return
+
+            title = win32gui.GetWindowText(hwnd)
+            if title.strip():
+                handles.append(hwnd)
+
+        win32gui.EnumWindows(enum_callback, None)
+
+        if not handles:
+            return False
+
+        hwnd = handles[0]
+
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+        return True
+
+    except Exception:
+        return False
+
+
+
+async def ensure_window_visible(page: Any, browser: Any | None = None) -> None:
+    """
+    Best-effort: restore + maximize (Windows), bring tab to front, focus, and set a sane viewport.
+    This helps when the browser was minimized and lazy-load / "load more" stops working.
+    """
+
+    # 1) OS-level restore/maximize (Windows only)
+    try:
+        if browser is not None and os.name == "nt":
+            pid = _get_browser_pid(browser)  # your helper
+            if pid:
+                ok = _win_restore_maximize_by_pid(pid)  # make it return bool if you can
+                log(f"[win] restore/maximize pid={pid} ok={ok}")
+                await asyncio.sleep(0.25)  # give Windows time to apply
+            else:
+                log("[win] restore/maximize skipped (pid not found)")
+    except Exception as e:
+        log(f"[win] restore/maximize error: {e}")
+
+    # 2) Bring tab to front
     try:
         if hasattr(page, "bring_to_front"):
             await page.bring_to_front()
@@ -38,34 +123,43 @@ async def ensure_window_visible(page: Any) -> None:
     except Exception:
         pass
 
-    # Maximize via JS (works sometimes, not always)
+    # 3) Focus via JS
     try:
         await page.evaluate(
             """
             (() => {
               try { window.focus(); } catch(e) {}
+              try { document.documentElement && document.documentElement.focus && document.documentElement.focus(); } catch(e) {}
               try { document.body && document.body.focus && document.body.focus(); } catch(e) {}
-              return true;
+              return { w: window.innerWidth, h: window.innerHeight, hasFocus: document.hasFocus ? document.hasFocus() : null };
             })()
             """
         )
     except Exception:
         pass
 
-    # Try to resize viewport (often helps lazy loading)
+    # 4) Use a REAL viewport (your 900x400 is too small and breaks many lazy-loaders)
     try:
+        vp = {"width": 1400, "height": 900}
         if hasattr(page, "set_viewport"):
-            await page.set_viewport({"width": 1400, "height": 900})
+            await page.set_viewport(vp)
         elif hasattr(page, "setViewport"):
-            await page.setViewport({"width": 1400, "height": 900})
+            await page.setViewport(vp)
     except Exception:
         pass
 
-    # Small delay after focusing/resizing
+    # 5) Nudge scroll a tiny bit to trigger IntersectionObserver / lazy loaders
     try:
-        await page.sleep(0.3)
+        await page.evaluate("window.scrollBy(0, 1);")
     except Exception:
         pass
+
+    # 6) Small settle delay
+    try:
+        await page.sleep(0.5)
+    except Exception:
+        pass
+
 
 
 async def _get_current_url(page: Any, fallback: str = "") -> str:
@@ -89,19 +183,36 @@ async def _get_current_url(page: Any, fallback: str = "") -> str:
     return fallback
 
 
-async def _refresh_current_url(page: Any, current_url: str) -> None:
-    """
-    Refresh the CURRENT URL (not the base target url), then wait for listing ready.
-    """
-    log(f"[recover] refresh current url: {current_url}")
+async def _get_scroll_y(page: Any) -> int:
+    try:
+        v = unwrap_remote(await page.evaluate("Number(window.scrollY || 0)"))
+        return int(v or 0)
+    except Exception:
+        return 0
+
+
+async def _restore_scroll_y(page: Any, y: int) -> None:
+    if y <= 0:
+        return
+    try:
+        await page.evaluate(f"window.scrollTo(0, {int(y)});")
+    except Exception:
+        pass
+    await page.sleep(0.6)
+
+
+async def _refresh_current_url(page: Any, current_url: str, restore_y: int) -> None:
+    log(f"[recover] refresh current url: {current_url} (restore_y={restore_y})")
     try:
         await page.reload()
     except Exception:
         await page.get(current_url)
 
     await wait_for_listing_ready(page)
-    await page.sleep(1.0)
+    await page.sleep(0.8)
 
+    # ✅ restore where we were
+    await _restore_scroll_y(page, restore_y)
 
 async def _try_open_new_tab(browser: Any, url: str) -> Optional[Any]:
     """
@@ -124,9 +235,8 @@ def _scroll_info(val: Any) -> dict:
     val = unwrap_remote(val)
     if isinstance(val, dict):
         return val
-    if isinstance(val, list) and val and isinstance(val[0], dict):
-        return val[0]
-    return {}
+    return {"beforeY": 0, "afterY": 0, "h": 0}
+
 
 
 def _details_status(payload: dict) -> Optional[int]:
@@ -144,7 +254,8 @@ def _details_status(payload: dict) -> Optional[int]:
 async def scrape_once(browser: Any, settings) -> None:
     log(f"[syarah] Opening: {settings.target_url}")
     page = await browser.get(settings.target_url)
-    await ensure_window_visible(page)
+    await ensure_window_visible(page, browser)
+
 
 
     await wait_for_listing_ready(page)
@@ -186,7 +297,9 @@ async def scrape_once(browser: Any, settings) -> None:
 
             if total and len(processed_ids) < int(total) and empty_visible_rounds >= 8:
                 cur_url = await _get_current_url(page, fallback=settings.target_url)
-                await _refresh_current_url(page, cur_url)
+                restore_y = await _get_scroll_y(page)
+                await _refresh_current_url(page, cur_url, restore_y)
+
                 empty_visible_rounds = 0
                 continue
 
@@ -212,7 +325,8 @@ async def scrape_once(browser: Any, settings) -> None:
         # If scrolling stalls AND we're not done, refresh current URL.
         # -------------------------
         if not unprocessed:
-            await ensure_window_visible(page)
+            await ensure_window_visible(page, browser)
+
             info = _scroll_info(await page.evaluate(JS_SCROLL_STEP))
 
             after_y = info.get("afterY")
@@ -237,7 +351,8 @@ async def scrape_once(browser: Any, settings) -> None:
             last_seen_unique = len(processed_ids)
             # ✅ If we are stuck, try clicking "Load more cars"
             if stuck_rounds >= 3:
-                await ensure_window_visible(page)
+                await ensure_window_visible(page, browser)
+
                 clicked = await try_click_load_more(page)
                 if clicked:
                     stuck_rounds = 0
@@ -316,7 +431,8 @@ async def scrape_once(browser: Any, settings) -> None:
 
         # ✅ Scroll only after processing this chunk
         if len(chunk) >= 16 or (len(chunk) == len(unprocessed)):
-            await ensure_window_visible(page)
+            await ensure_window_visible(page, browser)
+
             info = _scroll_info(await page.evaluate(JS_SCROLL_STEP))
             log(
                 f"[scroll] (after processing {len(chunk)}) "

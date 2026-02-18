@@ -21,12 +21,19 @@ SEL_LOAD_MORE = "a.LoadMoreBtn-module__link"
 
 JS_SCROLL_STEP = """
 (() => {
-  const beforeY = window.scrollY;
-  window.scrollBy(0, Math.max(900, window.innerHeight * 0.95));
-  const afterY = window.scrollY;
-  return { beforeY, afterY, h: document.body.scrollHeight };
+  try {
+    const beforeY = Number(window.scrollY || 0);
+    const step = Math.max(900, window.innerHeight * 0.95);
+    window.scrollBy(0, step);
+    const afterY = Number(window.scrollY || 0);
+    const h = Number(document.documentElement.scrollHeight || document.body.scrollHeight || 0);
+    return { beforeY, afterY, h };
+  } catch (e) {
+    return { beforeY: 0, afterY: 0, h: 0, err: String(e) };
+  }
 })()
 """.strip()
+
 
 
 def _js_str(s: str) -> str:
@@ -158,46 +165,41 @@ def abs_url(href: str) -> str:
 # -----------------------------
 # Load-more button support
 # -----------------------------
-async def try_click_load_more(page: Any) -> bool:
+async def try_click_load_more(page: Any, wait_sec: float = 6.0) -> bool:
     """
-    Click the "المزيد من السيارات" button if present & enabled.
-    Returns True if a click happened.
+    Click 'المزيد من السيارات' and wait for new cards to appear.
+    Returns True if cards increased.
     """
-    js = f"""
-(() => {{
-  const a = document.querySelector({_js_str(SEL_LOAD_MORE)});
-  if (!a) return {{found:false, clicked:false, reason:"missing"}};
-
-  // try to detect disabled
-  const text = (a.textContent || "").trim();
-  const parent = a.closest('div[data-enabled]');
-  const enabledAttr = parent ? parent.getAttribute('data-enabled') : null;
-
-  const isDisabled =
-    a.hasAttribute('disabled') ||
-    a.getAttribute('aria-disabled') === 'true' ||
-    (enabledAttr === 'false');
-
-  if (isDisabled) {{
-    return {{found:true, clicked:false, reason:"disabled", text}};
-  }}
-
-  a.click();
-  return {{found:true, clicked:true, reason:"clicked", text}};
-}})()
-""".strip()
-
     try:
-        info = unwrap_remote(await page.evaluate(js))
-        if isinstance(info, dict) and info.get("clicked"):
-            log(f"[loadmore] clicked ({info.get('text')})")
-            await page.sleep(1.2)
-            return True
-        return False
-    except Exception as e:
-        log(f"[loadmore] evaluate error: {e}")
+        before = len(await read_visible_cards(page))
+
+        # click using JS (more reliable)
+        clicked = unwrap_remote(await page.evaluate(f"""
+        (() => {{
+          const a = document.querySelector({_js_str(SEL_LOAD_MORE)});
+          if (!a) return false;
+          a.click();
+          return true;
+        }})()
+        """))
+
+        if not clicked:
+            return False
+
+        end = asyncio.get_event_loop().time() + wait_sec
+        while asyncio.get_event_loop().time() < end:
+            await page.sleep(0.5)
+            now = len(await read_visible_cards(page))
+            if now > before:
+                log(f"[load_more] cards {before} -> {now}")
+                return True
+
+        log(f"[load_more] clicked but no growth (cards={before})")
         return False
 
+    except Exception as e:
+        log(f"[load_more] error: {e}")
+        return False
 
 # -----------------------------
 # API URLs + requests session

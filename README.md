@@ -8,7 +8,15 @@ Scrapes listings from `https://syarah.com/filters`, loads cards as you scroll, a
 Stores results in MongoDB and skips duplicates (unique index on `id`).
 
 ## Why browser-context fetch?
+
 If you paste the API URL directly you may get `401 Unauthorized`. When you run `fetch()` from inside a logged-in/initialized browser page, the site cookies + any required headers are included, matching what you see in DevTools.
+
+====================
+Additional installs
+pip install requests
+pip install pywin32
+
+====================
 
 ## Setup
 
@@ -43,4 +51,3 @@ If you paste the API URL directly you may get `401 Unauthorized`. When you run `
 - If the API fetch still returns 401, you likely need extra headers (e.g., `x-something`) that the site adds.
   In that case, capture the request headers from DevTools for the API call and share them; the code has a place
   (`EXTRA_API_HEADERS_JSON`) to inject them.
-
