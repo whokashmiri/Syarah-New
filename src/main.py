@@ -21,6 +21,7 @@ from .syarah import (
     build_api_session,
     fetch_post_payloads_requests,
     try_click_load_more,
+    JS_WHEEL_SCROLL
 )
 
 
@@ -328,8 +329,10 @@ async def scrape_once(browser: Any, settings) -> None:
             await ensure_window_visible(page, browser)
 
             info = _scroll_info(await page.evaluate(JS_SCROLL_STEP))
+            log(f"[scroll_debug] mode={info.get('mode')} y:{info.get('beforeY')}->{info.get('afterY')} h={info.get('h')} clientH={info.get('clientH')}")
 
             after_y = info.get("afterY")
+            await page.evaluate(JS_WHEEL_SCROLL) 
 
             log(f"[scroll] (no new) y:{info.get('beforeY')}->{after_y} h={info.get('h')}")
             await page.sleep(settings.scroll_pause_sec)
@@ -361,7 +364,7 @@ async def scrape_once(browser: Any, settings) -> None:
             # refresh threshold
             if total and len(processed_ids) < int(total) and stuck_rounds >= 8:
                 cur_url = await _get_current_url(page, fallback=settings.target_url)
-                await _refresh_current_url(page, cur_url)
+                await _refresh_current_url(page, cur_url , restore_y)
                 stuck_rounds = 0
 
             continue

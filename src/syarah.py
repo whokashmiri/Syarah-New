@@ -19,21 +19,87 @@ CARD_ID_PREFIX = "modern-card_post-"
 # "Load more cars" button you mentioned
 SEL_LOAD_MORE = "a.LoadMoreBtn-module__link"
 
+# JS_SCROLL_STEP = """
+# (() => {
+#   try {
+#     const beforeY = Number(window.scrollY || 0);
+#     const step = Math.max(900, window.innerHeight * 0.95);
+#     window.scrollBy(0, step);
+#     const afterY = Number(window.scrollY || 0);
+#     const h = Number(document.documentElement.scrollHeight || document.body.scrollHeight || 0);
+#     return { beforeY, afterY, h };
+#   } catch (e) {
+#     return { beforeY: 0, afterY: 0, h: 0, err: String(e) };
+#   }
+# })()
+# """.strip()
+
+
+
 JS_SCROLL_STEP = """
 (() => {
-  try {
-    const beforeY = Number(window.scrollY || 0);
-    const step = Math.max(900, window.innerHeight * 0.95);
-    window.scrollBy(0, step);
-    const afterY = Number(window.scrollY || 0);
-    const h = Number(document.documentElement.scrollHeight || document.body.scrollHeight || 0);
-    return { beforeY, afterY, h };
-  } catch (e) {
-    return { beforeY: 0, afterY: 0, h: 0, err: String(e) };
+  const step = Math.max(900, window.innerHeight * 0.95);
+
+  const container =
+    document.querySelector('div.UnbxdCards-module__allCarsResult') ||
+    document.querySelector('div[id^="modern-card_post-"]')?.parentElement ||
+    null;
+
+  function isScrollable(el) {
+    if (!el) return false;
+    const st = getComputedStyle(el);
+    const oy = st.overflowY;
+    const can = (oy === "auto" || oy === "scroll");
+    return can && el.scrollHeight > el.clientHeight + 5;
   }
+
+  // Find real scroll element
+  let target = null;
+  let mode = "none";
+
+  if (container) {
+    let p = container;
+    for (let i = 0; i < 12 && p; i++) {
+      if (isScrollable(p)) { target = p; mode = "container-parent"; break; }
+      p = p.parentElement;
+    }
+  }
+
+  // Fallback to document scrolling element
+  if (!target) {
+    target = document.scrollingElement || document.documentElement;
+    mode = "document";
+  }
+
+  const beforeY = Number(target.scrollTop || 0);
+  const beforeH = Number(target.scrollHeight || 0);
+  const clientH = Number(target.clientHeight || 0);
+
+  // do scroll
+  target.scrollTop = beforeY + step;
+
+  // trigger events (important for lazy loaders)
+  try { target.dispatchEvent(new Event("scroll", { bubbles: true })); } catch(e) {}
+  try { window.dispatchEvent(new Event("scroll", { bubbles: true })); } catch(e) {}
+
+  const afterY = Number(target.scrollTop || 0);
+  const afterH = Number(target.scrollHeight || 0);
+
+  return { mode, beforeY, afterY, h: afterH, clientH };
 })()
 """.strip()
 
+
+JS_WHEEL_SCROLL = """
+(() => {
+  const delta = Math.max(900, window.innerHeight * 0.95);
+  const ev = new WheelEvent("wheel", { deltaY: delta, bubbles: true, cancelable: true });
+  (document.scrollingElement || document.documentElement || document.body).dispatchEvent(ev);
+  window.dispatchEvent(ev);
+  document.dispatchEvent(ev);
+  return true;
+})()
+""".strip()
 
 
 def _js_str(s: str) -> str:
