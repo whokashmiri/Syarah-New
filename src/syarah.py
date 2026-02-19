@@ -19,73 +19,103 @@ CARD_ID_PREFIX = "modern-card_post-"
 # "Load more cars" button you mentioned
 SEL_LOAD_MORE = "a.LoadMoreBtn-module__link"
 
-# JS_SCROLL_STEP = """
-# (() => {
-#   try {
-#     const beforeY = Number(window.scrollY || 0);
-#     const step = Math.max(900, window.innerHeight * 0.95);
-#     window.scrollBy(0, step);
-#     const afterY = Number(window.scrollY || 0);
-#     const h = Number(document.documentElement.scrollHeight || document.body.scrollHeight || 0);
-#     return { beforeY, afterY, h };
-#   } catch (e) {
-#     return { beforeY: 0, afterY: 0, h: 0, err: String(e) };
-#   }
-# })()
-# """.strip()
 
+
+def js_scroll_into_view(post_id: int) -> str:
+    return f"""
+(() => {{
+  const el = document.getElementById("modern-card_post-{int(post_id)}");
+  if (!el) return false;
+  el.scrollIntoView({{ block: "end", inline: "nearest" }});
+  try {{ window.scrollBy(0, 2); }} catch(e) {{}}
+  return true;
+}})()
+""".strip()
 
 
 JS_SCROLL_STEP = """
 (() => {
-  const step = Math.max(900, window.innerHeight * 0.95);
-
-  const container =
-    document.querySelector('div.UnbxdCards-module__allCarsResult') ||
-    document.querySelector('div[id^="modern-card_post-"]')?.parentElement ||
-    null;
+  const step = Math.max(900, (window.innerHeight || 900) * 0.95);
 
   function isScrollable(el) {
     if (!el) return false;
     const st = getComputedStyle(el);
     const oy = st.overflowY;
-    const can = (oy === "auto" || oy === "scroll");
-    return can && el.scrollHeight > el.clientHeight + 5;
+    // Some apps use overlay/hidden but still scroll; rely on scrollHeight too
+    const can = (oy === "auto" || oy === "scroll" || oy === "overlay" || oy === "visible" || oy === "hidden");
+    return can && el.scrollHeight > el.clientHeight + 50;
   }
 
-  // Find real scroll element
-  let target = null;
-  let mode = "none";
+  function pickScroller() {
+    // 1) obvious candidates
+    const candidates = [];
 
-  if (container) {
-    let p = container;
-    for (let i = 0; i < 12 && p; i++) {
-      if (isScrollable(p)) { target = p; mode = "container-parent"; break; }
-      p = p.parentElement;
+    const cards = document.querySelector('div.UnbxdCards-module__allCarsResult');
+    if (cards) {
+      candidates.push(cards);
+      // add parents up the chain
+      let p = cards.parentElement;
+      for (let i = 0; i < 10 && p; i++) { candidates.push(p); p = p.parentElement; }
     }
+
+    candidates.push(document.scrollingElement);
+    candidates.push(document.documentElement);
+    candidates.push(document.body);
+
+    // 2) pick first scrollable among candidates
+    for (const el of candidates) {
+      if (isScrollable(el)) return el;
+    }
+
+    // 3) fallback: find the biggest scrollable element in DOM
+    let best = null;
+    let bestDelta = 0;
+    const all = Array.from(document.querySelectorAll("body *"));
+    for (const el of all) {
+      if (!el) continue;
+      // skip tiny elements
+      if ((el.clientHeight || 0) < 200) continue;
+      const delta = (el.scrollHeight || 0) - (el.clientHeight || 0);
+      if (delta > bestDelta && isScrollable(el)) {
+        bestDelta = delta;
+        best = el;
+      }
+    }
+    if (best) return best;
+
+    // final fallback
+    return document.scrollingElement || document.documentElement || document.body;
   }
 
-  // Fallback to document scrolling element
-  if (!target) {
-    target = document.scrollingElement || document.documentElement;
-    mode = "document";
-  }
+  const target = pickScroller();
+  const mode =
+    target === document.scrollingElement || target === document.documentElement || target === document.body
+      ? "document"
+      : "container";
 
   const beforeY = Number(target.scrollTop || 0);
-  const beforeH = Number(target.scrollHeight || 0);
   const clientH = Number(target.clientHeight || 0);
+  const h = Number(target.scrollHeight || 0);
 
-  // do scroll
-  target.scrollTop = beforeY + step;
+  // Prefer scrollBy if available (more reliable)
+  try {
+    if (typeof target.scrollBy === "function") {
+      target.scrollBy(0, step);
+    } else {
+      target.scrollTop = beforeY + step;
+    }
+  } catch (e) {
+    try { target.scrollTop = beforeY + step; } catch (e2) {}
+  }
 
-  // trigger events (important for lazy loaders)
+  // Fire events to wake lazy loaders
   try { target.dispatchEvent(new Event("scroll", { bubbles: true })); } catch(e) {}
   try { window.dispatchEvent(new Event("scroll", { bubbles: true })); } catch(e) {}
 
   const afterY = Number(target.scrollTop || 0);
   const afterH = Number(target.scrollHeight || 0);
 
-  return { mode, beforeY, afterY, h: afterH, clientH };
+  return { mode, beforeY, afterY, h: afterH || h, clientH };
 })()
 """.strip()
 
@@ -231,7 +261,7 @@ def abs_url(href: str) -> str:
 # -----------------------------
 # Load-more button support
 # -----------------------------
-async def try_click_load_more(page: Any, wait_sec: float = 6.0) -> bool:
+async def try_click_load_more(page: Any, wait_sec: float = 8.0) -> bool:
     """
     Click 'المزيد من السيارات' and wait for new cards to appear.
     Returns True if cards increased.
@@ -239,12 +269,20 @@ async def try_click_load_more(page: Any, wait_sec: float = 6.0) -> bool:
     try:
         before = len(await read_visible_cards(page))
 
-        # click using JS (more reliable)
         clicked = unwrap_remote(await page.evaluate(f"""
         (() => {{
           const a = document.querySelector({_js_str(SEL_LOAD_MORE)});
           if (!a) return false;
-          a.click();
+
+          // Try click anchor
+          try {{ a.click(); }} catch(e) {{}}
+
+          // Try click parent too (some listeners attached on wrapper)
+          try {{
+            const p = a.closest('div');
+            if (p) p.click();
+          }} catch(e) {{}}
+
           return true;
         }})()
         """))
