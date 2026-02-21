@@ -36,8 +36,8 @@ pip install pywin32
 ## Environment variables
 
 - `MONGO_URL` (required)
-- `MONGO_DB` (default: `projectForever`)
-- `MONGO_COLLECTION` (default: `syarah_posts`)
+- `MONGO_DB` (default: `ElectronDB`)
+- `MONGO_COLLECTION` (default: `syarahNew`)
 - `TARGET_URL` (default: `https://syarah.com/filters`)
 - `HEADLESS` (default: `false`)
 - `CHECK_INTERVAL_HOURS` (default: `48`)

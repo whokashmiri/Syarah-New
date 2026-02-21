@@ -9,19 +9,22 @@ import requests
 
 from .logging_utils import log
 
-# IMPORTANT: BASE must be DOMAIN ONLY for abs_url()
 BASE = "https://syarah.com"
 
 SEL_TITLE_AREA = "div.UnbxdTitleArea-module__h1Area"
 SEL_CARDS_CONTAINER = "div.UnbxdCards-module__allCarsResult"
 CARD_ID_PREFIX = "modern-card_post-"
 
-# "Load more cars" button you mentioned
 SEL_LOAD_MORE = "a.LoadMoreBtn-module__link"
 
 
 
+
 def js_scroll_into_view(post_id: int) -> str:
+    """
+    Returns JS snippet that scrolls a specific card into view.
+    main.py calls: await page.evaluate(js_scroll_into_view(pid))
+    """
     return f"""
 (() => {{
   const el = document.getElementById("modern-card_post-{int(post_id)}");
@@ -33,110 +36,12 @@ def js_scroll_into_view(post_id: int) -> str:
 """.strip()
 
 
-JS_SCROLL_STEP = """
-(() => {
-  const step = Math.max(900, (window.innerHeight || 900) * 0.95);
-
-  function isScrollable(el) {
-    if (!el) return false;
-    const st = getComputedStyle(el);
-    const oy = st.overflowY;
-    // Some apps use overlay/hidden but still scroll; rely on scrollHeight too
-    const can = (oy === "auto" || oy === "scroll" || oy === "overlay" || oy === "visible" || oy === "hidden");
-    return can && el.scrollHeight > el.clientHeight + 50;
-  }
-
-  function pickScroller() {
-    // 1) obvious candidates
-    const candidates = [];
-
-    const cards = document.querySelector('div.UnbxdCards-module__allCarsResult');
-    if (cards) {
-      candidates.push(cards);
-      // add parents up the chain
-      let p = cards.parentElement;
-      for (let i = 0; i < 10 && p; i++) { candidates.push(p); p = p.parentElement; }
-    }
-
-    candidates.push(document.scrollingElement);
-    candidates.push(document.documentElement);
-    candidates.push(document.body);
-
-    // 2) pick first scrollable among candidates
-    for (const el of candidates) {
-      if (isScrollable(el)) return el;
-    }
-
-    // 3) fallback: find the biggest scrollable element in DOM
-    let best = null;
-    let bestDelta = 0;
-    const all = Array.from(document.querySelectorAll("body *"));
-    for (const el of all) {
-      if (!el) continue;
-      // skip tiny elements
-      if ((el.clientHeight || 0) < 200) continue;
-      const delta = (el.scrollHeight || 0) - (el.clientHeight || 0);
-      if (delta > bestDelta && isScrollable(el)) {
-        bestDelta = delta;
-        best = el;
-      }
-    }
-    if (best) return best;
-
-    // final fallback
-    return document.scrollingElement || document.documentElement || document.body;
-  }
-
-  const target = pickScroller();
-  const mode =
-    target === document.scrollingElement || target === document.documentElement || target === document.body
-      ? "document"
-      : "container";
-
-  const beforeY = Number(target.scrollTop || 0);
-  const clientH = Number(target.clientHeight || 0);
-  const h = Number(target.scrollHeight || 0);
-
-  // Prefer scrollBy if available (more reliable)
-  try {
-    if (typeof target.scrollBy === "function") {
-      target.scrollBy(0, step);
-    } else {
-      target.scrollTop = beforeY + step;
-    }
-  } catch (e) {
-    try { target.scrollTop = beforeY + step; } catch (e2) {}
-  }
-
-  // Fire events to wake lazy loaders
-  try { target.dispatchEvent(new Event("scroll", { bubbles: true })); } catch(e) {}
-  try { window.dispatchEvent(new Event("scroll", { bubbles: true })); } catch(e) {}
-
-  const afterY = Number(target.scrollTop || 0);
-  const afterH = Number(target.scrollHeight || 0);
-
-  return { mode, beforeY, afterY, h: afterH || h, clientH };
-})()
-""".strip()
-
-
-JS_WHEEL_SCROLL = """
-(() => {
-  const delta = Math.max(900, window.innerHeight * 0.95);
-  const ev = new WheelEvent("wheel", { deltaY: delta, bubbles: true, cancelable: true });
-  (document.scrollingElement || document.documentElement || document.body).dispatchEvent(ev);
-  window.dispatchEvent(ev);
-  document.dispatchEvent(ev);
-  return true;
-})()
-""".strip()
-
-
 def _js_str(s: str) -> str:
     return json.dumps(s)
 
 
 def unwrap_remote(obj: Any) -> Any:
+    # nodriver sometimes returns {type,value} remote objects
     if isinstance(obj, dict) and "type" in obj and "value" in obj:
         t = obj.get("type")
         v = obj.get("value")
@@ -156,6 +61,17 @@ def unwrap_remote(obj: Any) -> Any:
     return obj
 
 
+# -----------------------------
+# Small helpers
+# -----------------------------
+def abs_url(href: str) -> str:
+    if not href:
+        return ""
+    if href.startswith("http"):
+        return href
+    return BASE + href
+
+
 def js_get_total() -> str:
     return f"""
 (() => {{
@@ -169,6 +85,11 @@ def js_get_total() -> str:
 
 
 def js_get_visible_cards() -> str:
+    """
+    Stable extraction:
+    - Use container if exists else document
+    - Only return unique IDs
+    """
     return f"""
 (() => {{
   const prefix = {json.dumps(CARD_ID_PREFIX)};
@@ -177,6 +98,7 @@ def js_get_visible_cards() -> str:
 
   const nodes = Array.from(root.querySelectorAll(`div[id^="${{prefix}}"]`));
   const out = [];
+  const seen = new Set();
 
   for (const el of nodes) {{
     const idAttr = (el.getAttribute('id') || '').trim();
@@ -185,29 +107,31 @@ def js_get_visible_cards() -> str:
 
     const idNum = parseInt(m[1], 10);
     if (!Number.isFinite(idNum)) continue;
+    if (seen.has(idNum)) continue;
 
-    const a = el.querySelector('a[href^="/cardetail/"]');
+    // Any card link
+    let a = el.querySelector('a[href^="/cardetail/"]');
+    if (!a) {{
+      // fallback: any anchor with /cardetail/ inside
+      a = el.querySelector('a[href*="/cardetail/"]');
+    }}
     if (!a) continue;
 
     const href = (a.getAttribute('href') || '').trim();
     if (!href) continue;
 
+    seen.add(idNum);
     out.push([idNum, href]);
   }}
 
-  const seen = new Set();
-  const uniq = [];
-  for (const pair of out) {{
-    const id = pair[0];
-    if (seen.has(id)) continue;
-    seen.add(id);
-    uniq.push(pair);
-  }}
-  return uniq;
+  return out;
 }})()
 """.strip()
 
 
+# -----------------------------
+# Page readiness
+# -----------------------------
 async def wait_for_listing_ready(page: Any, timeout: float = 60.0) -> None:
     end = asyncio.get_event_loop().time() + timeout
     while True:
@@ -237,7 +161,6 @@ async def read_visible_cards(page: Any) -> List[Dict[str, Any]]:
         raw = unwrap_remote(await page.evaluate(js_get_visible_cards()))
         if not isinstance(raw, list):
             return []
-
         out: List[Dict[str, Any]] = []
         for item in raw:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -250,42 +173,35 @@ async def read_visible_cards(page: Any) -> List[Dict[str, Any]]:
         return []
 
 
-def abs_url(href: str) -> str:
-    if not href:
-        return ""
-    if href.startswith("http"):
-        return href
-    return BASE + href
-
-
 # -----------------------------
-# Load-more button support
+# Load more
 # -----------------------------
 async def try_click_load_more(page: Any, wait_sec: float = 8.0) -> bool:
     """
-    Click 'المزيد من السيارات' and wait for new cards to appear.
-    Returns True if cards increased.
+    Click 'Load more cars' and wait for new cards.
+    Safe for SPA:
+      - Scroll button into view
+      - Click via JS
+      - Poll until card count increases
     """
     try:
         before = len(await read_visible_cards(page))
 
         clicked = unwrap_remote(await page.evaluate(f"""
-        (() => {{
-          const a = document.querySelector({_js_str(SEL_LOAD_MORE)});
-          if (!a) return false;
+(() => {{
+  const a = document.querySelector({_js_str(SEL_LOAD_MORE)});
+  if (!a) return false;
 
-          // Try click anchor
-          try {{ a.click(); }} catch(e) {{}}
-
-          // Try click parent too (some listeners attached on wrapper)
-          try {{
-            const p = a.closest('div');
-            if (p) p.click();
-          }} catch(e) {{}}
-
-          return true;
-        }})()
-        """))
+  try {{ a.scrollIntoView({{block:"center", inline:"nearest"}}); }} catch(e) {{}}
+  try {{ a.click(); }} catch(e) {{
+    try {{
+      const ev = new MouseEvent("click", {{ bubbles:true, cancelable:true }});
+      a.dispatchEvent(ev);
+    }} catch(e2) {{}}
+  }}
+  return true;
+}})()
+"""))
 
         if not clicked:
             return False
@@ -304,6 +220,7 @@ async def try_click_load_more(page: Any, wait_sec: float = 8.0) -> bool:
     except Exception as e:
         log(f"[load_more] error: {e}")
         return False
+
 
 # -----------------------------
 # API URLs + requests session
@@ -454,7 +371,6 @@ def flatten_post(inspection_json: dict, details_json: dict) -> dict:
     flat["chassis_number"] = _first_str(_dig(ins_data, "chassis_number"))
     flat["plate_number"] = _first_str(_dig(ins_data, "plate_number"))
 
-    # BODY "clear"
     external_body = _dig(ins_data, "external_body") or {}
     body_sub = _dig(external_body, "sub") or []
     flat["body_is_clear"] = False
@@ -463,7 +379,6 @@ def flatten_post(inspection_json: dict, details_json: dict) -> dict:
         if isinstance(first_item, dict):
             flat["body_is_clear"] = first_item.get("body_is_clear") == 1
 
-    # IMAGES (FLAT list[str])
     gallery = _dig(det_data, "gallery.images") or []
     urls: List[str] = []
     featured_url: Optional[str] = None
@@ -478,7 +393,6 @@ def flatten_post(inspection_json: dict, details_json: dict) -> dict:
                 if img.get("is_featured") == 1 and not featured_url:
                     featured_url = url
 
-    # dedupe keep order
     seen = set()
     uniq_urls: List[str] = []
     for u in urls:
@@ -521,5 +435,4 @@ def fetch_post_payloads_requests(sess: requests.Session, lang: str, post_id: int
         "inspection_status": int(r1.get("status") or 0),
         "details_status": int(r2.get("status") or 0),
         **flat,
-        # NO api stored
     }
