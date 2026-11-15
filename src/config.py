@@ -1,6 +1,6 @@
-# config.py
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -23,7 +23,7 @@ def _get_int(name: str, default: int) -> int:
     if not v:
         return default
     try:
-        return int(str(v).strip())
+        return int(v)
     except Exception:
         return default
 
@@ -33,7 +33,7 @@ def _get_float(name: str, default: float) -> float:
     if not v:
         return default
     try:
-        return float(str(v).strip())
+        return float(v)
     except Exception:
         return default
 
@@ -42,6 +42,7 @@ def _get_float(name: str, default: float) -> float:
 class Settings:
     target_url: str
     headless: bool
+    browser_path: Optional[str]
 
     mongo_url: str
     mongo_db: str
@@ -49,7 +50,6 @@ class Settings:
 
     check_interval_hours: int
     scroll_pause_sec: float
-    batch_size: int   # ✅ FIX: proper dataclass field
 
     api_lang: str
 
@@ -66,17 +66,16 @@ class Settings:
 
 def get_settings() -> Settings:
     return Settings(
-        target_url=_get("TARGET_URL", "https://syarah.com/filters?condition_id=1") or "https://syarah.com/filters",
-       headless=(_get("HEADLESS", "false").strip().lower() in ("true", "1", "yes", "y")),
-
+        target_url=_get("TARGET_URL", "https://syarah.com/filters?condition_id=1"),
+        headless=(_get("HEADLESS", "false").lower() == "true"),
+        browser_path=_get("BROWSER_PATH"),
 
         mongo_url=_get("MONGO_URL", "") or "",
-        mongo_db=_get("MONGO_DB", "ELectronDB") or "ELectronDB",
+        mongo_db=_get("MONGO_DB", "ElectronDB") or "ElectronDB",
         mongo_collection=_get("MONGO_COLLECTION", "syarahUsed") or "syarahUsed",
 
         check_interval_hours=_get_int("CHECK_INTERVAL_HOURS", 48),
         scroll_pause_sec=_get_float("SCROLL_PAUSE_SEC", 1.5),
-        batch_size=_get_int("BATCH_SIZE", 16),  # ✅ FIX: always int
 
         api_lang=_get("SYARAH_API_LANG", "ar") or "ar",
 
