@@ -1,4 +1,3 @@
-# syarah.py
 from __future__ import annotations
 
 import asyncio
@@ -15,24 +14,53 @@ SEL_TITLE_AREA = "div.UnbxdTitleArea-module__h1Area"
 SEL_CARDS_CONTAINER = "div.UnbxdCards-module__allCarsResult"
 CARD_ID_PREFIX = "modern-card_post-"
 
-SEL_LOAD_MORE = "a.LoadMoreBtn-module__link"
+
+JS_SCROLL_STEP = """
+(() => {
+  const beforeY = window.scrollY;
+  window.scrollBy(0, Math.max(900, window.innerHeight * 0.95));
+  const afterY = window.scrollY;
+  return { beforeY, afterY, h: document.body.scrollHeight };
+})()
+""".strip()
 
 
+# Jump straight to the last loaded card (and the page bottom) so the site's
+# infinite-scroll trigger fires, instead of blind fixed-size steps.
+JS_SCROLL_TO_LAST_CARD = """
+(() => {
+  const cards = document.querySelectorAll('div[id^="modern-card_post-"]');
+  const last = cards.length ? cards[cards.length - 1] : null;
+  if (last) last.scrollIntoView({ block: 'end' });
+  window.scrollBy(0, 400);
+  return {
+    count: cards.length,
+    y: window.scrollY,
+    h: document.body.scrollHeight,
+    atBottom: (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 5)
+  };
+})()
+""".strip()
 
+# Scroll up a bit so the loader sentinel leaves the viewport (next bottom-scroll re-triggers it).
+JS_NUDGE_UP = "(() => { window.scrollBy(0, -1500); return window.scrollY; })()"
 
-def js_scroll_into_view(post_id: int) -> str:
-    """
-    Returns JS snippet that scrolls a specific card into view.
-    main.py calls: await page.evaluate(js_scroll_into_view(pid))
-    """
-    return f"""
-(() => {{
-  const el = document.getElementById("modern-card_post-{int(post_id)}");
-  if (!el) return false;
-  el.scrollIntoView({{ block: "end", inline: "nearest" }});
-  try {{ window.scrollBy(0, 2); }} catch(e) {{}}
-  return true;
-}})()
+# Click a visible "load more" button if the site shows one instead of auto-loading.
+JS_CLICK_LOAD_MORE = """
+(() => {
+  const re = /(load more|show more|المزيد|عرض المزيد|تحميل المزيد)/i;
+  const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+  for (const el of els) {
+    const t = (el.textContent || '').trim();
+    if (!t || t.length > 40 || !re.test(t)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    el.scrollIntoView({ block: 'center' });
+    el.click();
+    return true;
+  }
+  return false;
+})()
 """.strip()
 
 
@@ -40,8 +68,10 @@ def _js_str(s: str) -> str:
     return json.dumps(s)
 
 
+# -----------------------------
+# nodriver RemoteObject unwrap
+# -----------------------------
 def unwrap_remote(obj: Any) -> Any:
-    # nodriver sometimes returns {type,value} remote objects
     if isinstance(obj, dict) and "type" in obj and "value" in obj:
         t = obj.get("type")
         v = obj.get("value")
@@ -62,16 +92,8 @@ def unwrap_remote(obj: Any) -> Any:
 
 
 # -----------------------------
-# Small helpers
+# Listing page JS evaluators
 # -----------------------------
-def abs_url(href: str) -> str:
-    if not href:
-        return ""
-    if href.startswith("http"):
-        return href
-    return BASE + href
-
-
 def js_get_total() -> str:
     return f"""
 (() => {{
@@ -85,11 +107,6 @@ def js_get_total() -> str:
 
 
 def js_get_visible_cards() -> str:
-    """
-    Stable extraction:
-    - Use container if exists else document
-    - Only return unique IDs
-    """
     return f"""
 (() => {{
   const prefix = {json.dumps(CARD_ID_PREFIX)};
@@ -98,7 +115,6 @@ def js_get_visible_cards() -> str:
 
   const nodes = Array.from(root.querySelectorAll(`div[id^="${{prefix}}"]`));
   const out = [];
-  const seen = new Set();
 
   for (const el of nodes) {{
     const idAttr = (el.getAttribute('id') || '').trim();
@@ -107,31 +123,29 @@ def js_get_visible_cards() -> str:
 
     const idNum = parseInt(m[1], 10);
     if (!Number.isFinite(idNum)) continue;
-    if (seen.has(idNum)) continue;
 
-    // Any card link
-    let a = el.querySelector('a[href^="/cardetail/"]');
-    if (!a) {{
-      // fallback: any anchor with /cardetail/ inside
-      a = el.querySelector('a[href*="/cardetail/"]');
-    }}
+    const a = el.querySelector('a[href^="/cardetail/"]');
     if (!a) continue;
 
     const href = (a.getAttribute('href') || '').trim();
     if (!href) continue;
 
-    seen.add(idNum);
     out.push([idNum, href]);
   }}
 
-  return out;
+  const seen = new Set();
+  const uniq = [];
+  for (const pair of out) {{
+    const id = pair[0];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    uniq.push(pair);
+  }}
+  return uniq;
 }})()
 """.strip()
 
 
-# -----------------------------
-# Page readiness
-# -----------------------------
 async def wait_for_listing_ready(page: Any, timeout: float = 60.0) -> None:
     end = asyncio.get_event_loop().time() + timeout
     while True:
@@ -161,6 +175,7 @@ async def read_visible_cards(page: Any) -> List[Dict[str, Any]]:
         raw = unwrap_remote(await page.evaluate(js_get_visible_cards()))
         if not isinstance(raw, list):
             return []
+
         out: List[Dict[str, Any]] = []
         for item in raw:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -173,53 +188,12 @@ async def read_visible_cards(page: Any) -> List[Dict[str, Any]]:
         return []
 
 
-# -----------------------------
-# Load more
-# -----------------------------
-async def try_click_load_more(page: Any, wait_sec: float = 8.0) -> bool:
-    """
-    Click 'Load more cars' and wait for new cards.
-    Safe for SPA:
-      - Scroll button into view
-      - Click via JS
-      - Poll until card count increases
-    """
-    try:
-        before = len(await read_visible_cards(page))
-
-        clicked = unwrap_remote(await page.evaluate(f"""
-(() => {{
-  const a = document.querySelector({_js_str(SEL_LOAD_MORE)});
-  if (!a) return false;
-
-  try {{ a.scrollIntoView({{block:"center", inline:"nearest"}}); }} catch(e) {{}}
-  try {{ a.click(); }} catch(e) {{
-    try {{
-      const ev = new MouseEvent("click", {{ bubbles:true, cancelable:true }});
-      a.dispatchEvent(ev);
-    }} catch(e2) {{}}
-  }}
-  return true;
-}})()
-"""))
-
-        if not clicked:
-            return False
-
-        end = asyncio.get_event_loop().time() + wait_sec
-        while asyncio.get_event_loop().time() < end:
-            await page.sleep(0.5)
-            now = len(await read_visible_cards(page))
-            if now > before:
-                log(f"[load_more] cards {before} -> {now}")
-                return True
-
-        log(f"[load_more] clicked but no growth (cards={before})")
-        return False
-
-    except Exception as e:
-        log(f"[load_more] error: {e}")
-        return False
+def abs_url(href: str) -> str:
+    if not href:
+        return ""
+    if href.startswith("http"):
+        return href
+    return BASE + href
 
 
 # -----------------------------
@@ -237,6 +211,9 @@ def build_api_urls(lang: str, post_id: int) -> Tuple[str, str]:
 
 
 def build_api_session(settings) -> requests.Session:
+    """
+    Build a requests session that matches DevTools as closely as we can.
+    """
     s = requests.Session()
 
     headers = {
@@ -299,7 +276,11 @@ def _req_get_json_or_text(sess: requests.Session, url: str, referer: str) -> Dic
         }
 
 
+# -----------------------------
+# Helpers for flattening
+# -----------------------------
 def _dig(obj: Any, path: str) -> Any:
+    """Navigate nested dict/list by dot-separated path."""
     if obj is None:
         return None
     keys = path.split(".")
@@ -337,15 +318,85 @@ def _first_num(*vals: Any) -> Optional[float]:
     return None
 
 
+def _slug_en(s: Optional[str]) -> str:
+    s = (s or "").strip().lower()
+    out = []
+    prev_us = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+            prev_us = False
+        else:
+            if not prev_us:
+                out.append("_")
+                prev_us = True
+    key = "".join(out).strip("_")
+    return key or "unknown"
+
+
+def flatten_inspection_kv(categories: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    Input: car_report list (categories)
+    Output:
+      { "engine": { "الصوفة الامامية": "جيد", ... }, ... }
+    """
+    if not isinstance(categories, list):
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    used = set()
+
+    for cat in categories:
+        if not isinstance(cat, dict):
+            continue
+
+        key = _slug_en(cat.get("category_name_en"))
+        base = key
+        i = 2
+        while key in used:
+            key = f"{base}_{i}"
+            i += 1
+        used.add(key)
+
+        subs = cat.get("sub") or []
+        if not isinstance(subs, list):
+            subs = []
+
+        kv: Dict[str, Any] = {}
+        for s in subs:
+            if not isinstance(s, dict):
+                continue
+            name = (s.get("name") or "").strip()
+            if not name:
+                continue
+            kv[name] = s.get("rate")  # store rate text only
+        out[key] = kv
+
+    return out
+
+
 def flatten_post(inspection_json: dict, details_json: dict) -> dict:
+    """
+    Flatten the Syarah API responses into a searchable structure.
+    """
     ins_data = _dig(inspection_json, "data.inspection") or {}
     det_data = _dig(details_json, "data") or {}
 
     flat: Dict[str, Any] = {}
 
-    flat["post_id"] = _first_num(_dig(det_data, "details.id"))
-    flat["title"] = _first_str(_dig(det_data, "details.title"), _dig(det_data, "meta.title"))
+    # ========== BASIC IDENTITY ==========
+    flat["post_id"] = _first_num(
+        _dig(det_data, "details.id"),
+        # _dig(details_json, "id"),
+        # _dig(inspection_json, "id"),
+    )
 
+    flat["title"] = _first_str(
+        _dig(det_data, "details.title"),
+        _dig(det_data, "meta.title"),
+    )
+
+    # ========== VEHICLE SPECS ==========
     details_card = _dig(det_data, "details.details_card") or {}
 
     flat["brand"] = _first_str(_dig(details_card, "make.name"), _dig(details_card, "make.altName"))
@@ -355,57 +406,160 @@ def flatten_post(inspection_json: dict, details_json: dict) -> dict:
     flat["year"] = _first_num(_dig(details_card, "years.id"), _dig(details_card, "years.name"))
     flat["mileage_km"] = _first_num(_dig(details_card, "milage.id"), _dig(details_card, "milage.name"))
 
+    # ========== LOCATION & ORIGIN ==========
     flat["city"] = _first_str(_dig(det_data, "g4Data.post_city"))
     flat["origin"] = _first_str(_dig(details_card, "car_origin.name"))
 
+    # ========== MECHANICAL ==========
     flat["fuel_type"] = _first_str(_dig(details_card, "fuel_types.name"), _dig(det_data, "fuel.fuel_type"))
     flat["transmission"] = _first_str(_dig(details_card, "transmission_type.name"))
     flat["engine_size"] = _first_str(_dig(details_card, "engine_size.name"))
 
-    flat["seats"] = _first_num(_dig(details_card, "seats.id"), _dig(details_card, "seats.name"))
+    flat["cylinders"] = _first_num(_dig(details_card, "cylinders.id"), _dig(details_card, "cylinders.name"))
+    flat["horse_power"] = _first_num(_dig(details_card, "horse_power.id"), _dig(details_card, "horse_power.name"))
+    flat["drivetrain"] = _first_str(_dig(details_card, "drivetrain_type.name"))
+    flat["engine_type"] = _first_str(_dig(details_card, "engine_type.name"))
 
+    flat["fuel_tank_liters"] = _first_num(_dig(details_card, "fuel_tank.id"), _dig(details_card, "fuel_tank.name"))
+    flat["fuel_economy_kml"] = _first_num(_dig(det_data, "fuel.fuel_economy"))
+
+    # ========== PHYSICAL ==========
+    # flat["exterior_color"] = _first_str(_dig(details_card, "exterior_color.name"))
+    # flat["exterior_color_code"] = _first_str(_dig(details_card, "exterior_color.code"))
+    # flat["interior_color"] = _first_str(_dig(details_card, "interior_color.name"))
+    # flat["interior_color_code"] = _first_str(_dig(details_card, "interior_color.code"))
+
+    # flat["doors"] = _first_num(_dig(details_card, "doors.id"), _dig(details_card, "doors.name"))
+    flat["seats"] = _first_num(_dig(details_card, "seats.id"), _dig(details_card, "seats.name"))
+    # flat["number_of_keys"] = _first_num(_dig(details_card, "number_of_keys.id"), _dig(details_card, "number_of_keys.name"))
+
+    # ========== CONDITION ==========
+    # flat["condition"] = _first_str(_dig(details_card, "is_new.name"), _dig(details_card, "is_new.altName"))
+    # flat["is_preowned"] = _dig(det_data, "details.is_preowned")
+    # flat["is_test"] = _dig(det_data, "details.is_test")
+
+    # ========== PRICING ==========
     price_data = _dig(det_data, "price") or {}
     flat["price_cash"] = _first_num(_dig(price_data, "vat_price.text"), _dig(det_data, "analytics.price"))
     flat["price_monthly"] = _first_num(_dig(price_data, "finance_price.text"))
+    # flat["currency"] = _first_str(_dig(price_data, "currency"))
 
+    # flat["first_payment"] = _first_num(_dig(price_data, "finance_price.first_payment"))
+    # flat["last_payment"] = _first_num(_dig(price_data, "finance_price.last_payment"))
+    # flat["installment_period"] = _first_num(_dig(price_data, "finance_price.installment_period"))
+
+    # ========== INSPECTION (FLAT + KV) ==========
+    # flat["inspection_date"] = _first_str(_dig(ins_data, "report_date"))
     flat["chassis_number"] = _first_str(_dig(ins_data, "chassis_number"))
     flat["plate_number"] = _first_str(_dig(ins_data, "plate_number"))
 
+    car_report = _dig(ins_data, "car_report") or []
+    # flat["inspection_categories_count"] = len(car_report) if isinstance(car_report, list) else 0
+
+    total_points = 0
+    if isinstance(car_report, list):
+        for category in car_report:
+            if isinstance(category, dict):
+                sub = category.get("sub", [])
+                total_points += len(sub) if isinstance(sub, list) else 0
+    # flat["inspection_points_total"] = total_points
+
+    # ✅ the format you asked for
+    # flat["inspection_kv"] = flatten_inspection_kv(car_report)
+
+    # ========== BODY DAMAGE ==========
     external_body = _dig(ins_data, "external_body") or {}
     body_sub = _dig(external_body, "sub") or []
+    # flat["body_issues_count"] = _first_num(_dig(external_body, "category_countertext")) or 0
+
     flat["body_is_clear"] = False
     if isinstance(body_sub, list) and body_sub:
         first_item = body_sub[0]
         if isinstance(first_item, dict):
             flat["body_is_clear"] = first_item.get("body_is_clear") == 1
 
-    gallery = _dig(det_data, "gallery.images") or []
-    urls: List[str] = []
-    featured_url: Optional[str] = None
+    body_report = _dig(ins_data, "body_report") or []
+    body_damages: List[str] = []
+    if isinstance(body_report, list):
+        for item in body_report:
+            if isinstance(item, dict) and item.get("image_info"):
+                img_info = item["image_info"]
+                if isinstance(img_info, dict):
+                    note = img_info.get("note", "")
+                    if isinstance(note, str) and note.strip():
+                        body_damages.append(note.strip())
+    # flat["body_damage_notes"] = body_damages
 
+    # ========== IMAGES ==========
+    gallery = _dig(det_data, "gallery.images") or []
+    images: List[Dict[str, Any]] = []
+    featured_url: Optional[str] = None
     if isinstance(gallery, list):
         for img in gallery:
             if not isinstance(img, dict):
                 continue
             url = img.get("img_url")
             if isinstance(url, str) and url:
-                urls.append(url)
+                images.append(url)
                 if img.get("is_featured") == 1 and not featured_url:
                     featured_url = url
 
     seen = set()
     uniq_urls: List[str] = []
-    for u in urls:
+    for u in images:
         if u in seen:
             continue
         seen.add(u)
         uniq_urls.append(u)
+    flat["images"] = uniq_urls[:30]     # list[str]
+    # flat["images_count"] = len(uniq_urls)
 
-    flat["images"] = uniq_urls[:30]
     flat["featured_image"] = featured_url or (uniq_urls[0] if uniq_urls else None)
 
-    flat["share_link"] = _first_str(_dig(det_data, "details.share_link"))
+    # flat["has_360_spin"] = bool(_dig(det_data, "gallery.has_spin") or False)
+    # flat["has_video"] = bool(_dig(det_data, "gallery.has_video") or False)
 
+    # ========== FEATURES ==========
+    options = _dig(det_data, "options.options") or []
+    all_features: List[str] = []
+    features_by_category: Dict[str, List[str]] = {}
+
+    if isinstance(options, list):
+        for category in options:
+            if isinstance(category, dict):
+                cat_name = category.get("category")
+                cat_data = category.get("data", [])
+                if isinstance(cat_data, list):
+                    feature_names = [f.get("name") for f in cat_data if isinstance(f, dict) and f.get("name")]
+                else:
+                    feature_names = []
+                all_features.extend(feature_names)
+                if cat_name:
+                    features_by_category[str(cat_name)] = feature_names
+
+    # flat["features"] = all_features
+    # flat["features_count"] = len(all_features)
+    # flat["features_by_category"] = features_by_category
+
+    # ========== LISTING INFO ==========
+    flat["share_link"] = _first_str(_dig(det_data, "details.share_link"))
+    # flat["product_url"] = _first_str(_dig(det_data, "details.product_url"))
+
+    # flat["is_sold"] = _dig(det_data, "details.is_sold")
+    # flat["is_deleted"] = _dig(det_data, "details.is_deleted")
+    # flat["owned_by_us"] = _dig(det_data, "details.owned_by_us")
+
+    # flat["list_date"] = _first_str(_dig(det_data, "g4Data.list_date"))
+    # flat["lot_age_days"] = _first_num(_dig(det_data, "g4Data.lot_age"))
+
+    # ========== CAMPAIGN/OFFERS ==========
+    campaigns = _dig(det_data, "details.campaigns") or {}
+    # flat["has_cash_campaign"] = bool(_dig(campaigns, "cash"))
+    # flat["has_finance_campaign"] = bool(_dig(campaigns, "finance"))
+    cash_campaign = _dig(campaigns, "cash") or {}
+    # flat["campaign_text"] = _first_str(_dig(cash_campaign, "text"))
+
+    # ========== TAGS ==========
     tags = _dig(det_data, "details.tags") or []
     if isinstance(tags, list):
         flat["tags"] = [t.get("tag_name") for t in tags if isinstance(t, dict) and t.get("tag_name")]
@@ -413,6 +567,44 @@ def flatten_post(inspection_json: dict, details_json: dict) -> dict:
         flat["tags"] = []
 
     return flat
+
+
+# -----------------------------
+# Fetch function used by main.py
+# -----------------------------
+# def fetch_post_payloads_requests(sess: requests.Session, lang: str, post_id: int) -> Dict[str, Any]:
+#     u1, u2 = build_api_urls(lang, post_id)
+
+#     # best effort referer (slug doesn't matter usually)
+#     referer = f"https://syarah.com/{lang}/cardetail/used-{post_id}"
+
+#     r1 = _req_get_json_or_text(sess, u1, referer=referer)
+#     r2 = _req_get_json_or_text(sess, u2, referer=referer)
+
+#     inspection_json = (r1.get("json") if isinstance(r1, dict) else None) or {}
+#     details_json = (r2.get("json") if isinstance(r2, dict) else None) or {}
+
+#     flat = flatten_post(inspection_json, details_json)
+
+#     from datetime import datetime, timezone
+
+#     return {
+#         "id": int(post_id),
+#         "fetchedAt": datetime.now(timezone.utc).isoformat(),
+
+#         # helpful debug fields (small)
+#         # "details_status": r2.get("status"),
+#         # "inspection_status_code": r1.get("status"),
+
+#         # ✅ flat fields
+#         **flat,
+
+#         # ✅ keep raw (so main.py _details_status still works)
+#         # "api": {
+#         #     "inspection": {"url": u1, "res": r1},
+#         #     "details": {"url": u2, "res": r2},
+#         # },
+#     }
 
 
 def fetch_post_payloads_requests(sess: requests.Session, lang: str, post_id: int) -> Dict[str, Any]:
@@ -432,7 +624,14 @@ def fetch_post_payloads_requests(sess: requests.Session, lang: str, post_id: int
     return {
         "id": int(post_id),
         "fetchedAt": datetime.now(timezone.utc).isoformat(),
+
+        # ✅ tiny debug/status fields (VERY small)
         "inspection_status": int(r1.get("status") or 0),
         "details_status": int(r2.get("status") or 0),
+
+        # ✅ flat fields
         **flat,
+
+        # ❌ NO api stored
+        # "api": ...
     }
